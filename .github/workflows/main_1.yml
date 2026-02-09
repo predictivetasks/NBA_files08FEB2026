@@ -1,0 +1,21 @@
+name: Daily NBA Predictions
+
+on:
+  schedule:
+    - cron: '0 18 * * *'  # 12pm CST (6pm UTC)
+  workflow_dispatch:
+
+jobs:
+  run-predictions:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      
+      - uses: r-lib/actions/setup-r@v2
+      
+      - name: Install packages
+        run: |
+          Rscript -e 'install.packages(c("hoopR", "jsonlite", "httr2", "tidyverse", "lubridate", "zoo", "janitor"))'
+      
+      - name: Run daily predictions
+        run: Rscript nba_daily_predictions.R
