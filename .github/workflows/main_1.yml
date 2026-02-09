@@ -8,14 +8,37 @@ on:
 jobs:
   run-predictions:
     runs-on: ubuntu-latest
+    
     steps:
-      - uses: actions/checkout@v3
-      
+      - uses: actions/checkout@v4
+
       - uses: r-lib/actions/setup-r@v2
-      
-      - name: Install packages
+        with:
+          r-version: '4.3.2'
+
+      - name: Install system dependencies
         run: |
-          Rscript -e 'install.packages(c("hoopR", "jsonlite", "httr2", "tidyverse", "lubridate", "zoo", "janitor"))'
-      
+          sudo apt-get update
+          sudo apt-get install -y libcurl4-openssl-dev libssl-dev libxml2-dev
+
+      - name: Install R packages
+        run: |
+          Rscript -e 'install.packages(c("tidyverse", "tidymodels", "xgboost", "hoopR", "httr2", "jsonlite", "glue", "janitor", "slider"), repos = "https://cran.r-project.org")'
+
+      - name: Check for model file
+        run: |
+          if [ ! -f nba_models.RData ]; then
+            echo "ERROR: nba_models.RData not found. Run the training workflow first."
+            exit 1
+          fi
+
       - name: Run daily predictions
         run: Rscript nba_daily_predictions.R
+
+      - name: Commit predictions
+        run: |
+          git config --local user.name "github-actions"
+          git config --local user.email "actions@github.com"
+          git add -f predictions_*.csv
+          git commit -m "Predictions $(date +'%Y-%m-%d')" || echo "No games today"
+          git push
