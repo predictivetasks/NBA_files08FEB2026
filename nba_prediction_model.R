@@ -15,7 +15,7 @@ required_pkgs <- c(
   "hoopR", "jsonlite", "httr2",
   # Wrangling
 
-  "tidyverse", "lubridate", "zoo", "janitor",
+  "tidyverse", "lubridate", "zoo", "janitor", "slider", "glue",
   # Modeling
   "tidymodels", "xgboost", "finetune", "probably", "vip",
   # Evaluation & Viz
@@ -39,82 +39,233 @@ cat("
 \n")
 
 # ---- 1. DATA INGESTION ------------------------------------------------------
-# Pull game-level data from ESPN via hoopR for the 2025-26 season.
-# We pull team box scores for every completed game.
+# Pull team-level box scores for every completed game of the 2025-26 season.
+# We try multiple methods in order of reliability.
 
 cat("[1/6] Pulling NBA game data...\n")
 
-# --- 1a. Team game logs from ESPN ---
-# hoopR::espn_nba_scoreboard pulls day-by-day results.
-# We'll iterate over every date of the season so far.
+game_logs <- tibble()   # will hold our final clean data
 
-season_start <- as.Date("2025-10-28")
-today        <- Sys.Date()
-date_seq     <- seq.Date(season_start, today - 1, by = "day")
+# ---- METHOD 0: hoopR::load_nba_team_box (GitHub-cached data) ----
+# This pulls pre-cached data from GitHub releases — works from ANY IP
+# including cloud/CI environments (GitHub Actions, etc.) where the
+# NBA Stats API blocks requests. This is the most reliable method.
 
-pull_scoreboard_safe <- possibly(espn_nba_scoreboard, otherwise = NULL)
+cat("   Trying Method 0: load_nba_team_box (GitHub cached)...\n")
 
-raw_scores <- date_seq |>
-  map(\(d) {
-    Sys.sleep(0.3)                       # polite rate-limiting
-    pull_scoreboard_safe(d)
-  }) |>
-  compact()
-
-# The scoreboard returns a nested list; we need the game-level data.
-# Extract and flatten into a tidy game-level frame.
-
-parse_scoreboard <- function(sb) {
-  if (is.null(sb) || length(sb) == 0) return(tibble())
-  # Different hoopR versions return slightly different structures.
-  # We handle both the list-of-dataframes and single-dataframe cases.
-  if (is.data.frame(sb)) return(sb)
-  if (is.list(sb) && "games" %in% names(sb)) return(as_tibble(sb$games))
-  if (is.list(sb)) {
-    bind_rows(sb) |> as_tibble()
+game_logs <- tryCatch({
+  raw <- hoopR::load_nba_team_box(seasons = 2026)
+  if (is.data.frame(raw) && nrow(raw) > 0) {
+    df <- raw |> as_tibble() |> clean_names()
+    # Standardize column names to match what the rest of the script expects
+    # load_nba_team_box uses ESPN-style names; map to NBA Stats style
+    name_map <- c(
+      "game_id"            = "game_id",
+      "game_date"          = "game_date",
+      "team_short_display_name" = "team_abbreviation",
+      "team_abbreviation"  = "team_abbreviation",
+      "team_slug"          = "team_abbreviation",
+      "field_goals_made"   = "fgm",
+      "field_goals_attempted" = "fga",
+      "three_point_field_goals_made" = "fg3m",
+      "three_point_field_goals_attempted" = "fg3a",
+      "free_throws_made"   = "ftm",
+      "free_throws_attempted" = "fta",
+      "offensive_rebounds"  = "oreb",
+      "defensive_rebounds"  = "dreb",
+      "total_rebounds"      = "reb",
+      "assists"             = "ast",
+      "steals"              = "stl",
+      "blocks"              = "blk",
+      "turnovers"           = "tov",
+      "team_turnovers"      = "tov",
+      "points"              = "pts",
+      "team_score"          = "pts"
+    )
+    # Apply renaming for columns that exist
+    existing <- intersect(names(name_map), names(df))
+    if (length(existing) > 0) {
+      for (old_name in existing) {
+        new_name <- name_map[old_name]
+        if (new_name != old_name && !new_name %in% names(df)) {
+          names(df)[names(df) == old_name] <- new_name
+        }
+      }
+    }
+    # Ensure game_date is Date type
+    if ("game_date" %in% names(df)) {
+      df <- df |> mutate(game_date = as.Date(game_date))
+    }
+    # Normalize ESPN team abbreviations to NBA Stats standard
+    abbr_fixes <- c("GS" = "GSW", "SA" = "SAS", "PHO" = "PHX", "NY" = "NYK",
+                    "NO" = "NOP", "UTAH" = "UTA", "WSH" = "WAS", "BKN" = "BKN")
+    if ("team_abbreviation" %in% names(df)) {
+      for (from in names(abbr_fixes)) {
+        df$team_abbreviation[df$team_abbreviation == from] <- abbr_fixes[from]
+      }
+    }
+    cat(glue::glue("   ✓ Method 0 succeeded: {nrow(df)} rows.\n"))
+    df
   } else {
     tibble()
   }
-}
-
-games_raw <- raw_scores |>
-  map(parse_scoreboard) |>
-  bind_rows() |>
-  distinct()
-
-cat(glue::glue("   → Pulled data for {nrow(games_raw)} game records across {length(date_seq)} dates.\n\n"))
-
-# --- 1b. Alternative / supplement: nba_leaguegamelog ---
-# This gives us clean team-level box scores per game.
-# Season "2025-26" uses the starting year as the identifier.
-
-cat("   Pulling league game logs (team-level box scores)...\n")
-
-# hoopR wraps the NBA stats API; season_type "Regular Season" = "Regular+Season"
-game_logs_raw <- tryCatch({
-  nba_leaguegamelog(
-    season          = "2025-26",
-    season_type_all_star = "Regular Season",
-    player_or_team  = "T"           # T = team level
-  )
 }, error = function(e) {
-  message("   ⚠ nba_leaguegamelog failed: ", e$message)
-  message("   Falling back to ESPN-only pipeline.")
-  NULL
+  message("   ⚠ Method 0 failed: ", e$message)
+  tibble()
 })
 
-# The API returns a list; the main data lives in $LeagueGameLog
-if (!is.null(game_logs_raw) && "LeagueGameLog" %in% names(game_logs_raw)) {
-  game_logs <- game_logs_raw$LeagueGameLog |>
-    as_tibble() |>
-    clean_names()
-} else if (!is.null(game_logs_raw) && is.data.frame(game_logs_raw)) {
-  game_logs <- game_logs_raw |> as_tibble() |> clean_names()
-} else {
-  game_logs <- tibble()
+# ---- METHOD 1: hoopR::nba_leaguegamelog (NBA Stats API wrapper) ----
+# This is the cleanest single-call approach. We try several parameter combos
+# because hoopR versions differ in argument names.
+
+if (nrow(game_logs) == 0) {
+cat("   Trying Method 1: nba_leaguegamelog...\n")
+
+# hoopR uses the ENDING year for season (2025-26 season = 2026)
+season_attempts <- list(
+  list(season = "2025-26", season_type_all_star = "Regular Season", player_or_team = "T"),
+  list(season = 2026,      season_type_all_star = "Regular Season", player_or_team = "T"),
+  list(season = "2025-26", season_type = "Regular Season", player_or_team = "T"),
+  list(season = 2026,      season_type = "Regular Season", player_or_team = "T")
+)
+
+for (i in seq_along(season_attempts)) {
+  params <- season_attempts[[i]]
+  game_logs_raw <- tryCatch({
+    do.call(nba_leaguegamelog, params)
+  }, error = function(e) NULL)
+
+  if (!is.null(game_logs_raw)) {
+    # Extract the data — hoopR returns either a list with $LeagueGameLog or a dataframe
+    if (is.list(game_logs_raw) && !is.data.frame(game_logs_raw)) {
+      # It's a named list; find the data element
+      for (nm in c("LeagueGameLog", "league_game_log", names(game_logs_raw)[1])) {
+        if (nm %in% names(game_logs_raw) && is.data.frame(game_logs_raw[[nm]])) {
+          game_logs <- game_logs_raw[[nm]] |> as_tibble() |> clean_names()
+          break
+        }
+      }
+      # If still empty, try first element
+      if (nrow(game_logs) == 0 && length(game_logs_raw) > 0 && is.data.frame(game_logs_raw[[1]])) {
+        game_logs <- game_logs_raw[[1]] |> as_tibble() |> clean_names()
+      }
+    } else if (is.data.frame(game_logs_raw)) {
+      game_logs <- game_logs_raw |> as_tibble() |> clean_names()
+    }
+  }
+  if (nrow(game_logs) > 0) {
+    cat(glue::glue("   ✓ Method 1 succeeded (attempt {i}): {nrow(game_logs)} rows.\n"))
+    break
+  }
 }
 
-cat(glue::glue("   → {nrow(game_logs)} team-game box score rows.\n\n"))
+}
+
+# ---- METHOD 2: Direct NBA Stats API call via httr2 ----
+# If hoopR wrapper failed, hit the API directly.
+
+if (nrow(game_logs) == 0) {
+  cat("   Method 1 failed. Trying Method 2: Direct NBA Stats API...\n")
+
+  game_logs <- tryCatch({
+    resp <- httr2::request("https://stats.nba.com/stats/leaguegamelog") |>
+      httr2::req_url_query(
+        Season       = "2025-26",
+        SeasonType   = "Regular Season",
+        PlayerOrTeam = "T",
+        LeagueID     = "00",
+        Direction    = "ASC",
+        Sorter       = "DATE"
+      ) |>
+      httr2::req_headers(
+        `User-Agent`      = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        `Accept`          = "application/json",
+        `Accept-Language`  = "en-US,en;q=0.9",
+        `Referer`         = "https://www.nba.com/",
+        `x-nba-stats-origin` = "stats",
+        `x-nba-stats-token`  = "true"
+      ) |>
+      httr2::req_retry(max_tries = 3, backoff = ~ 2) |>
+      httr2::req_perform()
+
+    json <- httr2::resp_body_json(resp)
+
+    # NBA Stats API returns: resultSets -> [0] -> headers + rowSet
+    headers <- unlist(json$resultSets[[1]]$headers)
+    rows    <- json$resultSets[[1]]$rowSet
+
+    df <- do.call(rbind, lapply(rows, function(r) {
+      as.data.frame(matrix(unlist(r), nrow = 1, byrow = TRUE), stringsAsFactors = FALSE)
+    }))
+    names(df) <- headers
+    df |> as_tibble() |> clean_names()
+  }, error = function(e) {
+    message("   ⚠ Method 2 failed: ", e$message)
+    tibble()
+  })
+
+  if (nrow(game_logs) > 0) cat(glue::glue("   ✓ Method 2 succeeded: {nrow(game_logs)} rows.\n"))
+}
+
+# ---- METHOD 3: hoopR ESPN team box scores (game-by-game) ----
+# Slower but more reliable than the NBA Stats API.
+
+if (nrow(game_logs) == 0) {
+  cat("   Method 2 failed. Trying Method 3: ESPN team box scores...\n")
+
+  # Use espn_nba_team_box to pull completed games
+  game_logs <- tryCatch({
+    # Pull the schedule to get game IDs first
+    schedule <- espn_nba_scoreboard(season = 2026)
+    if (is.data.frame(schedule) && nrow(schedule) > 0) {
+      schedule |> as_tibble() |> clean_names()
+    } else {
+      tibble()
+    }
+  }, error = function(e) {
+    message("   ⚠ Method 3 (schedule) failed: ", e$message)
+    tibble()
+  })
+
+  if (nrow(game_logs) > 0) cat(glue::glue("   ✓ Method 3 succeeded: {nrow(game_logs)} rows.\n"))
+}
+
+# ---- METHOD 4: Load from CSV (manual fallback) ----
+
+if (nrow(game_logs) == 0 && file.exists("nba_game_logs_2025_26.csv")) {
+  cat("   Trying Method 4: Loading from local CSV...\n")
+  game_logs <- read_csv("nba_game_logs_2025_26.csv", show_col_types = FALSE) |> clean_names()
+  if (nrow(game_logs) > 0) cat(glue::glue("   ✓ Loaded {nrow(game_logs)} rows from CSV.\n"))
+}
+
+# ---- DIAGNOSTICS: Print what we got ----
+
+if (nrow(game_logs) == 0) {
+  stop(paste0(
+    "\n\n",
+    "====================================================================\n",
+    "  ALL DATA PULL METHODS FAILED\n",
+    "====================================================================\n",
+    "  This usually means the NBA Stats API is blocking requests or\n",
+    "  hoopR needs an update.\n\n",
+    "  TROUBLESHOOTING:\n",
+    "  1. Run: install.packages('hoopR') to get the latest version\n",
+    "  2. Check your internet connection\n",
+    "  3. Try running in a fresh R session\n",
+    "  4. The NBA Stats API sometimes blocks non-browser requests.\n",
+    "     Wait a few minutes and retry.\n",
+    "  5. Manual fallback: download game logs as CSV from\n",
+    "     Basketball Reference (basketball-reference.com) and save as\n",
+    "     'nba_game_logs_2025_26.csv' in your working directory.\n",
+    "====================================================================\n"
+  ))
+}
+
+cat(glue::glue("\n   → {nrow(game_logs)} team-game box score rows loaded.\n"))
+cat("   Column names: ", paste(names(game_logs)[1:min(10, ncol(game_logs))], collapse = ", "), "...\n")
+cat("   Checking a few rows:\n")
+print(head(game_logs, 3))
+cat("\n")
 
 # ---- 2. DATA CLEANING & STRUCTURING -----------------------------------------
 
@@ -123,43 +274,113 @@ cat("[2/6] Cleaning and structuring data...\n")
 # We need a game-level dataframe where each row = one game, with columns for
 # both home and away team stats.
 
-# --- 2a. Parse the game logs ---
-# Typical columns: team_id, team_abbreviation, game_id, game_date, matchup,
-# wl, pts, fgm, fga, fg_pct, fg3m, fg3a, fg3_pct, ftm, fta, ft_pct,
-# oreb, dreb, reb, ast, stl, blk, tov, pf, plus_minus, min
+# --- 2a. Normalize column names ---
+# Different API methods return slightly different column names.
+# We standardize to a common set here.
 
-if (nrow(game_logs) > 0) {
+cat("   Detected columns: ", paste(names(game_logs), collapse = ", "), "\n\n")
 
-  games <- game_logs |>
-    mutate(
-      game_date = as.Date(game_date, format = "%b %d, %Y"),
-      across(c(pts, fgm, fga, fg3m, fg3a, ftm, fta,
-               oreb, dreb, reb, ast, stl, blk, tov, pf, plus_minus),
-             as.numeric),
-      is_home = str_detect(matchup, "vs\\."),
-      opponent = str_extract(matchup, "(?<=(vs\\.|@\\s?))[A-Z]{2,3}$") |> str_trim()
-    )
+# Standardize common name variations
+name_map <- c(
+  "team_abbreviation" = "team_abbreviation",
+  "team_name"         = "team_name",
+  "game_id"           = "game_id",
+  "game_date"         = "game_date",
+  "matchup"           = "matchup",
+  "wl"                = "wl",
+  "w"                 = "wl",                    # some versions use w/l
+  "pts"               = "pts",
+  "fgm"               = "fgm",
+  "fga"               = "fga",
+  "fg_pct"            = "fg_pct",
+  "fg3m"              = "fg3m",
+  "fg3a"              = "fg3a",
+  "fg3_pct"           = "fg3_pct",
+  "ftm"               = "ftm",
+  "fta"               = "fta",
+  "ft_pct"            = "ft_pct",
+  "oreb"              = "oreb",
+  "dreb"              = "dreb",
+  "reb"               = "reb",
+  "ast"               = "ast",
+  "stl"               = "stl",
+  "blk"               = "blk",
+  "tov"               = "tov",
+  "pf"                = "pf",
+  "plus_minus"        = "plus_minus"
+)
 
-  # Separate home and away, then join on game_id
-  home_games <- games |> filter(is_home) |>
-    rename_with(~ paste0("home_", .), -c(game_id, game_date))
-
-  away_games <- games |> filter(!is_home) |>
-    rename_with(~ paste0("away_", .), -c(game_id, game_date))
-
-  game_matchups <- inner_join(home_games, away_games, by = c("game_id", "game_date")) |>
-    mutate(
-      total_points = home_pts + away_pts,
-      point_diff   = home_pts - away_pts,         # positive = home win
-      home_win     = as.integer(point_diff > 0)
-    ) |>
-    arrange(game_date)
-
-  cat(glue::glue("   → {nrow(game_matchups)} structured game matchups.\n\n"))
-
-} else {
-  stop("No game log data available. Check your hoopR installation and network connection.")
+# Check which expected columns exist
+expected_stats <- c("pts", "fgm", "fga", "fg3m", "fg3a", "ftm", "fta",
+                    "oreb", "dreb", "reb", "ast", "stl", "blk", "tov", "pf", "plus_minus")
+missing_cols <- setdiff(expected_stats, names(game_logs))
+if (length(missing_cols) > 0) {
+  cat("   ⚠ Missing columns (will be set to 0): ", paste(missing_cols, collapse = ", "), "\n")
+  for (mc in missing_cols) game_logs[[mc]] <- 0
 }
+
+# --- 2b. Parse and type-convert ---
+
+# Detect date format (skip if already Date type)
+if (inherits(game_logs$game_date, "Date")) {
+  date_fmt <- "already_date"
+} else {
+  sample_date <- as.character(game_logs$game_date[1])
+  if (grepl("^\\d{4}-\\d{2}-\\d{2}", sample_date)) {
+    date_fmt <- "%Y-%m-%d"
+  } else if (grepl("[A-Z][a-z]{2} \\d", sample_date)) {
+    date_fmt <- "%b %d, %Y"
+  } else {
+    date_fmt <- NULL  # let lubridate guess
+  }
+}
+
+# Detect home/away - ESPN data uses home_away column, NBA Stats uses matchup
+if ("home_away" %in% names(game_logs)) {
+  game_logs <- game_logs |> mutate(is_home = (home_away == "home"))
+} else if ("matchup" %in% names(game_logs)) {
+  game_logs <- game_logs |> mutate(is_home = str_detect(matchup, "vs\\."))
+} else {
+  stop("Cannot determine home/away status — no 'matchup' or 'home_away' column found.")
+}
+
+# Handle date parsing - might already be Date type from Method 0
+if (inherits(game_logs$game_date, "Date")) {
+  date_parsed <- game_logs$game_date
+} else if (!is.null(date_fmt)) {
+  date_parsed <- as.Date(game_logs$game_date, format = date_fmt)
+} else {
+  date_parsed <- lubridate::ymd(game_logs$game_date)
+}
+
+games <- game_logs |>
+  mutate(
+    game_date = date_parsed,
+    across(any_of(expected_stats), ~ as.numeric(as.character(.)))
+  ) |>
+  filter(!is.na(game_date), !is.na(pts), !is.na(is_home))
+
+cat(glue::glue("   → {nrow(games)} valid game rows after cleaning.\n"))
+cat(glue::glue("   → Date range: {min(games$game_date)} to {max(games$game_date)}\n"))
+cat(glue::glue("   → Teams: {n_distinct(games$team_abbreviation)}\n\n"))
+
+# --- 2c. Separate home and away, then join on game_id ---
+
+home_games <- games |> filter(is_home) |>
+  rename_with(~ paste0("home_", .), -c(game_id, game_date))
+
+away_games <- games |> filter(!is_home) |>
+  rename_with(~ paste0("away_", .), -c(game_id, game_date))
+
+game_matchups <- inner_join(home_games, away_games, by = c("game_id", "game_date")) |>
+  mutate(
+    total_points = home_pts + away_pts,
+    point_diff   = home_pts - away_pts,         # positive = home win
+    home_win     = as.integer(point_diff > 0)
+  ) |>
+  arrange(game_date)
+
+cat(glue::glue("   → {nrow(game_matchups)} structured game matchups.\n\n"))
 
 # ---- 3. FEATURE ENGINEERING --------------------------------------------------
 
@@ -170,6 +391,16 @@ cat("[3/6] Engineering features...\n")
 # (no data leakage).
 
 # --- 3a. Team-level per-game stats to build rolling features from ---
+
+# Ensure wl column exists (ESPN data uses team_winner instead)
+if (!"wl" %in% names(games)) {
+  if ("team_winner" %in% names(games)) {
+    games <- games |> mutate(wl = ifelse(team_winner == TRUE, "W", "L"))
+  } else {
+    # Fallback: infer from points later; placeholder for now
+    games <- games |> mutate(wl = "U")
+  }
+}
 
 team_game_stats <- games |>
   arrange(team_abbreviation, game_date) |>
@@ -297,8 +528,16 @@ cat("   Rolling and EMA features computed.\n")
 # --- 3e. Opponent defensive strength (rolling opponent allowed stats) ---
 # We need opponent's defensive profile to adjust our offensive expectations.
 
-# First, compute each team's "points allowed" and defensive metrics.
-# For this, we pair each game row with the opponent's stats from the same game.
+# Instead of relying on regex-parsed opponent names, we pair teams by game_id.
+# Every game_id has exactly 2 rows (one per team). The opponent is the OTHER team.
+
+opp_lookup <- team_game_stats |>
+  select(game_id, team_abbreviation) |>
+  group_by(game_id) |>
+  filter(n() == 2) |>                    # only games with exactly 2 team rows
+  mutate(opponent = rev(team_abbreviation)) |>
+  ungroup() |>
+  select(game_id, team_abbreviation, opponent)
 
 opp_stats <- team_game_stats |>
   select(game_id, team_abbreviation, pts, poss, efg_pct, tov_pct, fg3m, fg3a) |>
@@ -306,15 +545,8 @@ opp_stats <- team_game_stats |>
   rename(opponent_team = team_abbreviation)
 
 team_features <- team_features |>
-  left_join(
-    # We need the opponent abbreviation per game; it's in the matchup string
-    team_game_stats |> select(game_id, team_abbreviation, opponent),
-    by = c("game_id", "team_abbreviation")
-  ) |>
-  left_join(
-    opp_stats,
-    by = c("game_id", "opponent" = "opponent_team")
-  )
+  left_join(opp_lookup, by = c("game_id", "team_abbreviation")) |>
+  left_join(opp_stats, by = c("game_id", "opponent" = "opponent_team"))
 
 # Rolling opponent points allowed (defensive strength proxy)
 team_features <- team_features |>
